@@ -1,0 +1,1 @@
+worker: python ton_mcap_bot.py
