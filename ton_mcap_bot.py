@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import requests
+import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -10,7 +11,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 load_dotenv()
 
-BOT_TOKEN = "8317423103:AAFo0xO2vqVQnv0_wU6xyfQiVRh3_9vdx5w"
+BOT_TOKEN = "8317423103:AAEcqWbC_I0SuMeLTx46Wql_L8pbxh5jkRk"
 CHANNEL_USERNAME = "@TWinXposT"
 
 MCAP_MIN = float(os.getenv("MCAP_MIN", "10000"))
@@ -46,13 +47,19 @@ def init_db():
     conn.close()
 
 
-def already_posted(token_address):
+def already_posted(token_address, name=None):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute(
-        "SELECT token_address FROM posted_tokens WHERE token_address = ?",
-        (token_address,)
-    )
+    if name:
+        cur.execute(
+            "SELECT token_address FROM posted_tokens WHERE token_address = ? OR LOWER(name) = LOWER(?)",
+            (token_address, name)
+        )
+    else:
+        cur.execute(
+            "SELECT token_address FROM posted_tokens WHERE token_address = ?",
+            (token_address,)
+        )
     row = cur.fetchone()
     conn.close()
     return row is not None
@@ -73,6 +80,49 @@ def save_posted(token_address, symbol, name, market_cap):
     ))
     conn.commit()
     conn.close()
+
+
+def check_token_security(token_address):
+    url = f"https://tonapi.io/v2/jettons/{token_address}"
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            
+            # 1. Whitelisted is safe
+            verification = data.get("verification", "none")
+            if verification == "whitelist":
+                return True
+                
+            # 2. Blacklisted or marked scam is unsafe
+            if verification == "blacklist":
+                print(f"Skipping {token_address}: Blacklisted token")
+                return False
+                
+            if data.get("admin", {}).get("is_scam", False):
+                print(f"Skipping {token_address}: Admin account is marked as scam")
+                return False
+                
+            # 3. Custom/Modified contract check
+            # Standard Jetton master code hashes:
+            standard_hashes = {
+                "mg+Y3W+/Il7vgWXk5kQX7pMffuoABlNDnntdzcBkTNY=",
+                "ci03vlGO4NS2cUB3cn7WByS/N56PFHnCILhT0a888A0="
+            }
+            code_hash = data.get("code_hash")
+            if code_hash not in standard_hashes:
+                print(f"Skipping {token_address}: Modified contract ({code_hash}), proceed with caution!")
+                return False
+                
+            return True
+            
+        elif response.status_code == 404:
+            print(f"Skipping {token_address}: Not found on TonAPI")
+            return False
+            
+    except Exception as e:
+        print(f"Security check error for {token_address}: {e}")
+        return True # Fallback to True to avoid complete blocking on transient network errors
 
 
 def money(value):
@@ -211,7 +261,12 @@ async def scan_and_post(context: ContextTypes.DEFAULT_TYPE):
             if already_posted(token_address):
                 continue
 
+            # Check security of token contract
+            if not check_token_security(token_address):
+                continue
+
             pair = get_best_pair(token_address)
+            await asyncio.sleep(1) # Add delay to avoid rate limiting on APIs
 
             if not pair:
                 continue
@@ -220,6 +275,11 @@ async def scan_and_post(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             text, keyboard, contract, symbol, name, market_cap, image_url = build_post(pair)
+
+            # Check if name is already posted
+            if already_posted(contract, name):
+                print(f"Skipping {name} (${symbol}): Name already posted.")
+                continue
 
             if image_url:
                 await context.bot.send_photo(
