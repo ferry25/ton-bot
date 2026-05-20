@@ -133,11 +133,11 @@ def money(value):
 
 
 def make_stonks_link(contract):
-    return f"https://t.me/{STONKS_TRADE_BOT}?start={STONKS_REF_CODE}_{contract}"
+    return f"https://t.me/stonks_sniper_bot?start=id=phreak3r044={contract}"
 
 
 def make_dtrade_link(contract):
-    return f"https://t.me/{DTRADE_BOT}?start={DTRADE_REF_CODE}"
+    return f"https://t.me/dtrade?start=26UsbJoMqw_{contract}"
 
 
 def get_latest_ton_tokens():
@@ -242,7 +242,7 @@ def build_post(pair):
             InlineKeyboardButton("📊 Chart", url=chart_url)
         ],
         [
-            InlineKeyboardButton("💬 Channel", url="https://t.me/TWinXposT")
+            InlineKeyboardButton("💬 Marketing", url="https://t.me/Phreak3r044")
         ]
     ])
 
