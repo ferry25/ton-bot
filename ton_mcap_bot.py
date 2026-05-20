@@ -15,7 +15,7 @@ load_dotenv()
 BOT_TOKEN = "8317423103:AAEcqWbC_I0SuMeLTx46Wql_L8pbxh5jkRk"
 CHANNEL_USERNAME = "@TWinXposT"
 
-MCAP_MIN = float(os.getenv("MCAP_MIN", "10000"))
+MCAP_MIN = float(os.getenv("MCAP_MIN", "5000"))
 MCAP_MAX = float(os.getenv("MCAP_MAX", "20000"))
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "5"))
 
