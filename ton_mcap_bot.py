@@ -28,8 +28,9 @@ DTRADE_BOT = "dtrade"
 
 DB_NAME = "ton_tokens.db"
 
-DEX_LATEST = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEX_PAIRS = "https://api.dexscreener.com/token-pairs/v1/ton/{}"
+GECKO_POOLS = "https://api.geckoterminal.com/api/v2/networks/ton/pools"
+GECKO_HEADERS = {"Accept": "application/json;version=20230302"}
 
 
 def init_db():
@@ -160,15 +161,74 @@ def make_dtrade_link(contract):
     return f"https://t.me/dtrade?start=26UsbJoMqw_{contract}"
 
 
-def get_latest_ton_tokens():
-    response = requests.get(DEX_LATEST, timeout=20)
-    response.raise_for_status()
-    data = response.json()
+def get_active_ton_pairs():
+    """Fetch active TON pools from GeckoTerminal in the MCAP range,
+    then enrich each with DexScreener pair data for chart URL and image."""
+    result = []
+    seen_addresses = set()
 
-    return [
-        item for item in data
-        if item.get("chainId") == "ton" and item.get("tokenAddress")
-    ]
+    for page in range(1, 4):  # Check up to 3 pages
+        try:
+            r = requests.get(
+                GECKO_POOLS,
+                params={"page": page},
+                headers=GECKO_HEADERS,
+                timeout=20
+            )
+            r.raise_for_status()
+            pools = r.json().get("data", [])
+        except Exception as e:
+            print(f"GeckoTerminal page {page} error: {e}")
+            break
+
+        if not pools:
+            break
+
+        found_in_range = False
+        for pool in pools:
+            attrs = pool.get("attributes", {})
+            rels = pool.get("relationships", {})
+
+            mcap_str = attrs.get("market_cap_usd")
+            try:
+                mcap = float(mcap_str) if mcap_str else 0
+            except:
+                continue
+
+            if mcap < MCAP_MIN:
+                continue  # Pools are sorted by volume, not mcap, so keep scanning
+            if mcap > MCAP_MAX:
+                continue
+
+            found_in_range = True
+
+            # Extract base token address from relationship id: "ton_<address>"
+            base_token_id = (rels.get("base_token", {}).get("data") or {}).get("id", "")
+            token_address = base_token_id.replace("ton_", "", 1) if base_token_id.startswith("ton_") else ""
+
+            if not token_address or token_address in seen_addresses:
+                continue
+
+            # Enrich with DexScreener pair data for chart URL, image, txns, etc.
+            try:
+                r2 = requests.get(DEX_PAIRS.format(token_address), timeout=15)
+                pairs = r2.json() if r2.status_code == 200 else []
+            except:
+                pairs = []
+
+            if not pairs:
+                continue
+
+            ton_pairs = [p for p in pairs if p.get("chainId") == "ton"]
+            if not ton_pairs:
+                continue
+
+            best_pair = max(ton_pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
+
+            seen_addresses.add(token_address)
+            result.append(best_pair)
+
+    return result
 
 
 def get_best_pair(token_address):
@@ -370,33 +430,28 @@ async def scan_and_post(context: ContextTypes.DEFAULT_TYPE):
     print("Scanning TON tokens...")
 
     try:
-        tokens = get_latest_ton_tokens()
+        pairs = get_active_ton_pairs()
+        print(f"Found {len(pairs)} TON pairs in MCAP range ${MCAP_MIN:,.0f}-${MCAP_MAX:,.0f}")
 
-        for token in tokens:
-            token_address = token.get("tokenAddress")
+        for pair in pairs:
+            contract = (pair.get("baseToken") or {}).get("address", "")
+            name = (pair.get("baseToken") or {}).get("name", "Unknown")
+            symbol = (pair.get("baseToken") or {}).get("symbol", "UNKNOWN")
 
-            if already_posted(token_address):
+            if not contract:
+                continue
+
+            # Skip if already posted (by address or name)
+            if already_posted(contract, name):
                 continue
 
             # Check security of token contract
-            if not check_token_security(token_address):
+            if not check_token_security(contract):
                 continue
 
-            pair = get_best_pair(token_address)
-            await asyncio.sleep(1) # Add delay to avoid rate limiting on APIs
-
-            if not pair:
-                continue
-
-            if not is_valid_pair(pair):
-                continue
+            await asyncio.sleep(1)  # Avoid rate limiting on TonAPI
 
             text, keyboard, contract, symbol, name, market_cap, image_url = build_post(pair)
-
-            # Check if name is already posted
-            if already_posted(contract, name):
-                print(f"Skipping {name} (${symbol}): Name already posted.")
-                continue
 
             msg = None
             if image_url:
