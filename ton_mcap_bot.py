@@ -2,7 +2,8 @@ import os
 import sqlite3
 import requests
 import asyncio
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -40,9 +41,25 @@ def init_db():
             symbol TEXT,
             name TEXT,
             market_cap REAL,
-            posted_at TEXT
+            posted_at TEXT,
+            message_id INTEGER,
+            max_mcap REAL,
+            last_updated TEXT
         )
     """)
+    # Safely migrate existing databases
+    try:
+        cur.execute("ALTER TABLE posted_tokens ADD COLUMN message_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cur.execute("ALTER TABLE posted_tokens ADD COLUMN max_mcap REAL")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cur.execute("ALTER TABLE posted_tokens ADD COLUMN last_updated TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -65,16 +82,19 @@ def already_posted(token_address, name=None):
     return row is not None
 
 
-def save_posted(token_address, symbol, name, market_cap):
+def save_posted(token_address, symbol, name, market_cap, message_id=None):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute("""
-        INSERT OR REPLACE INTO posted_tokens
-        VALUES (?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO posted_tokens (token_address, symbol, name, market_cap, posted_at, message_id, max_mcap, last_updated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         token_address,
         symbol,
         name,
+        market_cap,
+        datetime.utcnow().isoformat(),
+        message_id,
         market_cap,
         datetime.utcnow().isoformat()
     ))
@@ -249,6 +269,103 @@ def build_post(pair):
     return text, keyboard, contract, symbol, name, float(market_cap), image_url
 
 
+async def update_pnl(context: ContextTypes.DEFAULT_TYPE):
+    print("Updating PnL of posted tokens...")
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        # Fetch tokens posted in the last 24 hours that have a message_id
+        one_day_ago = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        cur.execute("""
+            SELECT token_address, symbol, name, market_cap, message_id, max_mcap
+            FROM posted_tokens
+            WHERE posted_at >= ? AND message_id IS NOT NULL
+        """, (one_day_ago,))
+        rows = cur.fetchall()
+        conn.close()
+
+        for row in rows:
+            token_address, symbol, name, initial_mcap, message_id, max_mcap = row
+
+            pair = get_best_pair(token_address)
+            await asyncio.sleep(1) # Add delay to avoid rate limiting
+
+            if not pair:
+                continue
+
+            current_mcap = pair.get("marketCap") or pair.get("fdv") or 0
+            try:
+                current_mcap = float(current_mcap)
+            except:
+                continue
+
+            if current_mcap <= 0:
+                continue
+
+            # Calculate PnL
+            pnl_percent = ((current_mcap - initial_mcap) / initial_mcap) * 100
+
+            # Check and update peak/max mcap
+            new_max_mcap = max(max_mcap or 0, current_mcap)
+            peak_pnl_percent = ((new_max_mcap - initial_mcap) / initial_mcap) * 100
+
+            # Update database
+            conn = sqlite3.connect(DB_NAME)
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE posted_tokens
+                SET max_mcap = ?, last_updated = ?
+                WHERE token_address = ?
+            """, (new_max_mcap, datetime.utcnow().isoformat(), token_address))
+            conn.commit()
+            conn.close()
+
+            # Rebuild original post text
+            text, keyboard, contract, symbol, name, _, image_url = build_post(pair)
+
+            # Formulate PnL block
+            pnl_emoji = "📈" if pnl_percent >= 0 else "📉"
+            pnl_section = (
+                f"📊 Current Mcap: <b>{money(current_mcap)}</b>\n"
+                f"{pnl_emoji} <b>PnL: {pnl_percent:+.1f}%</b> (Peak: {peak_pnl_percent:+.1f}%)\n\n"
+            )
+
+            # Replace current market cap line with initial market cap line
+            text = re.sub(
+                r"💰 Market Cap: <b>.*?</b>",
+                f"💰 Initial Mcap: <b>{money(initial_mcap)}</b>",
+                text
+            )
+
+            # Insert PnL block before "DYOR"
+            text = text.replace("⚠️ <b>DYOR. Not financial advice.</b>", f"{pnl_section}⚠️ <b>DYOR. Not financial advice.</b>")
+
+            try:
+                if image_url:
+                    await context.bot.edit_message_caption(
+                        chat_id=CHANNEL_USERNAME,
+                        message_id=message_id,
+                        caption=text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard
+                    )
+                else:
+                    await context.bot.edit_message_text(
+                        chat_id=CHANNEL_USERNAME,
+                        message_id=message_id,
+                        text=text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard,
+                        disable_web_page_preview=False
+                    )
+                print(f"Updated PnL for {name} (${symbol}): {pnl_percent:+.1f}%")
+            except Exception as e:
+                print(f"Failed to edit message {message_id} for {name}: {e}")
+
+    except Exception as e:
+        print("ERROR updating PnL:", e)
+
+
 async def scan_and_post(context: ContextTypes.DEFAULT_TYPE):
     print("Scanning TON tokens...")
 
@@ -281,8 +398,9 @@ async def scan_and_post(context: ContextTypes.DEFAULT_TYPE):
                 print(f"Skipping {name} (${symbol}): Name already posted.")
                 continue
 
+            msg = None
             if image_url:
-                await context.bot.send_photo(
+                msg = await context.bot.send_photo(
                     chat_id=CHANNEL_USERNAME,
                     photo=image_url,
                     caption=text,
@@ -290,7 +408,7 @@ async def scan_and_post(context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=keyboard
                 )
             else:
-                await context.bot.send_message(
+                msg = await context.bot.send_message(
                     chat_id=CHANNEL_USERNAME,
                     text=text,
                     parse_mode=ParseMode.HTML,
@@ -298,8 +416,9 @@ async def scan_and_post(context: ContextTypes.DEFAULT_TYPE):
                     disable_web_page_preview=False
                 )
 
-            save_posted(contract, symbol, name, market_cap)
-            print(f"Posted: {name} ${symbol} - {money(market_cap)}")
+            message_id = msg.message_id if msg else None
+            save_posted(contract, symbol, name, market_cap, message_id)
+            print(f"Posted: {name} ${symbol} - {money(market_cap)} (Message ID: {message_id})")
 
     except Exception as e:
         print("ERROR:", e)
@@ -319,6 +438,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Scan manual dimulai...")
     await scan_and_post(context)
+    await update_pnl(context)
     await update.message.reply_text("✅ Scan selesai.")
 
 
@@ -345,6 +465,13 @@ def main():
         scan_and_post,
         interval=SCAN_INTERVAL_MINUTES * 60,
         first=10
+    )
+
+    # Run PnL updater every 5 minutes
+    app.job_queue.run_repeating(
+        update_pnl,
+        interval=300,
+        first=30
     )
 
     print("TON MCAP bot running...")
