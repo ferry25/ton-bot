@@ -1,4 +1,5 @@
 import os
+import sys
 import sqlite3
 import requests
 import asyncio
@@ -524,30 +525,68 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📊 Total token posted: {total}")
 
 
+PID_FILE = "/tmp/ton_mcap_bot.pid"
+
+
+def acquire_lock():
+    """Prevent multiple instances using a PID file."""
+    if os.path.exists(PID_FILE):
+        with open(PID_FILE, "r") as f:
+            old_pid = f.read().strip()
+        try:
+            os.kill(int(old_pid), 0)  # Check if process still alive
+            print(f"Bot already running (PID {old_pid}). Killing old instance...")
+            os.kill(int(old_pid), 9)
+            import time; time.sleep(3)
+        except (OSError, ValueError):
+            pass  # Process not running, stale PID file
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+
+def release_lock():
+    if os.path.exists(PID_FILE):
+        os.remove(PID_FILE)
+
+
 def main():
     init_db()
+    acquire_lock()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    try:
+        app = (
+            Application.builder()
+            .token(BOT_TOKEN)
+            .connect_timeout(30)
+            .read_timeout(30)
+            .write_timeout(30)
+            .build()
+        )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("scan", scan_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("scan", scan_cmd))
+        app.add_handler(CommandHandler("stats", stats_cmd))
 
-    app.job_queue.run_repeating(
-        scan_and_post,
-        interval=SCAN_INTERVAL_MINUTES * 60,
-        first=10
-    )
+        app.job_queue.run_repeating(
+            scan_and_post,
+            interval=SCAN_INTERVAL_MINUTES * 60,
+            first=10
+        )
 
-    # Run PnL updater every 5 minutes
-    app.job_queue.run_repeating(
-        update_pnl,
-        interval=300,
-        first=30
-    )
+        # Run PnL updater every 5 minutes
+        app.job_queue.run_repeating(
+            update_pnl,
+            interval=300,
+            first=30
+        )
 
-    print("TON MCAP bot running...")
-    app.run_polling()
+        print("TON MCAP bot running...")
+        app.run_polling(
+            drop_pending_updates=True,  # Clear stale connections on startup
+            allowed_updates=["message", "callback_query"]
+        )
+    finally:
+        release_lock()
 
 
 if __name__ == "__main__":
