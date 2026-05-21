@@ -1,0 +1,4 @@
+ton_tokens.db
+__pycache__/
+*.pyc
+.env
