@@ -15,7 +15,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 load_dotenv()
 
-BOT_TOKEN = "8317423103:AAEcqWbC_I0SuMeLTx46Wql_L8pbxh5jkRk"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8317423103:AAEcqWbC_I0SuMeLTx46Wql_L8pbxh5jkRk")
 CHANNEL_USERNAME = "@TWinXposT"
 
 MCAP_MIN = float(os.getenv("MCAP_MIN", "5000"))
