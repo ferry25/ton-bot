@@ -1,11 +1,13 @@
 import os
 import sys
+import time
 import sqlite3
 import requests
 import asyncio
 import re
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -171,6 +173,8 @@ def get_active_ton_pairs():
     seen_addresses = set()
 
     for page in range(1, 11):  # Check up to 10 pages (pools sorted by volume, not MCAP)
+        if page > 1:
+            time.sleep(2)  # Avoid GeckoTerminal 429 rate limit
         try:
             r = requests.get(
                 GECKO_POOLS,
