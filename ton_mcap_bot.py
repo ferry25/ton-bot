@@ -163,11 +163,13 @@ def make_dtrade_link(contract):
 
 def get_active_ton_pairs():
     """Fetch active TON pools from GeckoTerminal in the MCAP range,
-    then enrich each with DexScreener pair data for chart URL and image."""
+    then enrich each with DexScreener pair data for chart URL and image.
+    Scans up to 10 pages since pools are sorted by volume (not MCAP).
+    Falls back to DexScreener marketCap/fdv when GeckoTerminal MCAP is null."""
     result = []
     seen_addresses = set()
 
-    for page in range(1, 4):  # Check up to 3 pages
+    for page in range(1, 11):  # Check up to 10 pages (pools sorted by volume, not MCAP)
         try:
             r = requests.get(
                 GECKO_POOLS,
@@ -184,23 +186,9 @@ def get_active_ton_pairs():
         if not pools:
             break
 
-        found_in_range = False
         for pool in pools:
             attrs = pool.get("attributes", {})
             rels = pool.get("relationships", {})
-
-            mcap_str = attrs.get("market_cap_usd")
-            try:
-                mcap = float(mcap_str) if mcap_str else 0
-            except:
-                continue
-
-            if mcap < MCAP_MIN:
-                continue  # Pools are sorted by volume, not mcap, so keep scanning
-            if mcap > MCAP_MAX:
-                continue
-
-            found_in_range = True
 
             # Extract base token address from relationship id: "ton_<address>"
             base_token_id = (rels.get("base_token", {}).get("data") or {}).get("id", "")
@@ -209,7 +197,20 @@ def get_active_ton_pairs():
             if not token_address or token_address in seen_addresses:
                 continue
 
-            # Enrich with DexScreener pair data for chart URL, image, txns, etc.
+            # Try GeckoTerminal MCAP first
+            mcap_str = attrs.get("market_cap_usd")
+            gecko_mcap = None
+            try:
+                gecko_mcap = float(mcap_str) if mcap_str else None
+            except:
+                gecko_mcap = None
+
+            # If GeckoTerminal MCAP is available and clearly out of range, skip early
+            if gecko_mcap is not None:
+                if gecko_mcap < MCAP_MIN or gecko_mcap > MCAP_MAX:
+                    continue
+
+            # Enrich with DexScreener pair data for chart URL, image, txns, and accurate MCAP
             try:
                 r2 = requests.get(DEX_PAIRS.format(token_address), timeout=15)
                 pairs = r2.json() if r2.status_code == 200 else []
@@ -225,9 +226,26 @@ def get_active_ton_pairs():
 
             best_pair = max(ton_pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
 
+            # Use DexScreener marketCap/fdv as the authoritative MCAP value
+            dex_mcap = best_pair.get("marketCap") or best_pair.get("fdv") or 0
+            try:
+                dex_mcap = float(dex_mcap)
+            except:
+                dex_mcap = 0
+
+            # Final MCAP check using DexScreener (more reliable)
+            if dex_mcap == 0:
+                # If DexScreener has no MCAP either, only include if GeckoTerminal confirmed range
+                if gecko_mcap is None:
+                    continue
+            else:
+                if dex_mcap < MCAP_MIN or dex_mcap > MCAP_MAX:
+                    continue
+
             seen_addresses.add(token_address)
             result.append(best_pair)
 
+    print(f"Found {len(result)} TON pairs in MCAP range ${MCAP_MIN:,.0f}-${MCAP_MAX:,.0f}")
     return result
 
 
@@ -431,7 +449,6 @@ async def scan_and_post(context: ContextTypes.DEFAULT_TYPE):
 
     try:
         pairs = get_active_ton_pairs()
-        print(f"Found {len(pairs)} TON pairs in MCAP range ${MCAP_MIN:,.0f}-${MCAP_MAX:,.0f}")
 
         for pair in pairs:
             contract = (pair.get("baseToken") or {}).get("address", "")
